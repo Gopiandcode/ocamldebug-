@@ -1,0 +1,439 @@
+* Tasks
+** Setup basic interaction scheme a la gopcaml-mode
+** Define Zipper + Highlighting
+* Deciphering the OCaml Debugger
+This will be a rather curt writeup of the notes I've taken while going
+through the source code of the OCaml debugger.
+
+Again, it's pretty much just a direct transcription of my raw notes,
+so don't expect any spectacular writing or anything.
+
+Anway, let's get started.
+** Module structure
+We'll start by using a combination of OCamldep and OCamldot to build a
+quick graph of the module dependencies in the debugger:
+
+#+BEGIN_SRC sh
+> ocamldep * | ocamldot | dot -G300 -Tpng > ~/Documents/code/ocaml/debugger/guide.png
+#+END_SRC
+
+
+
+[[file:guide.png]]
+
+Alright, cool, let's traverse this tree from the leaves upward!
+*** Modules
+**** Int64 Ops
+Defines aliases for operations for the Int64 type.
+#+BEGIN_SRC ocaml
+let ( ++ ) = Int64.add
+let ( -- ) = Int64.sub
+let suc64 = Int64.succ
+#+END_SRC
+**** Debugger Config
+This module encapsulates the various core parameters used within the
+debugger - i.e things like the string for the prompt, the shell
+command, etc..
+
+Most of the values here are constants - one interesting value is the
+shell command, which is mostly constant, but determined based on the
+OS type:
+#+BEGIN_SRC ocaml
+let shell =
+  match Sys.os_type with
+    "Win32" -> "cmd"
+  | _ -> "/bin/sh"
+#+END_SRC
+Another parameter of note is the environment:
+#+BEGIN_SRC ocaml
+val environment : (string * string) list ref
+#+END_SRC
+Which is the variable representing the environment variables for the
+debuggee - initially empty, presumably, it will be set at a later point.
+
+
+Another parameter of note is the =load_path_for= hashtable which will
+maintain a list of module names to a list of load paths:
+#+BEGIN_SRC ocaml
+val load_path_for : (string, string list) Hashtbl.t
+#+END_SRC
+See [[*Source][Source]] for an example of how this is used 
+**** Parameters
+This depends on the debugger-config, and then defines a series of
+mutable parameters that will be changed at runtime:
+  - program name
+  - socket name
+  - arguments
+  - default load path
+  - break point
+  - prompt
+  - time
+  - version
+  - topdirs path
+  - emacs
+  - machine readable
+
+Another interesting component of this file is that the default load
+path uses the ocaml-compiler-libs.common library to access
+=Config.standard_library=, which is a variable which contains the path
+to the standard library.
+
+#+BEGIN_SRC ocaml
+let default_load_path =
+  ref [ Filename.current_dir_name; Config.standard_library ]
+#+END_SRC
+**** Primitives
+Defines a series of helper functions - this is really just a Utils
+module of miscellaneous functions that the debugger uses elsewhere
+(i.e index, list_truncate, list_replace, string_trim etc.).
+
+One other point of note is that it defines a type to represent I/O channels:
+#+BEGIN_SRC ocaml
+type io_channel = {
+  io_in : in_channel;
+  io_out : out_channel;
+  io_fd : Unix.file_descr
+  }
+
+val io_channel_of_descr : Unix.file_descr -> io_channel
+val close_io : io_channel -> unit
+val std_io : io_channel
+#+END_SRC
+(Implemented in the natural way).
+**** Input handling
+Maintains a assoc-list of active files to channels + controller:
+#+BEGIN_SRC ocaml
+let active_files =
+  ref ([] : (file_descr * ((io_channel -> unit) * io_channel)) list)
+#+END_SRC
+As seen above, each active file is a file descriptor, with an IO
+channel, and callback that consumes/controls the channel.
+
+As file descriptors are unique, the file descriptor acts as a key, and
+external modules can add/remove files by supplying a file and a
+constructor if adding.
+
+#+BEGIN_SRC ocaml
+(* Remove a file from the list of actives files. *)
+let remove_file file =
+  active_files := List.remove_assoc file.io_fd !active_files
+#+END_SRC
+
+Then there are functions to change the controller for a file, or
+return the current controller.
+***** Main loop
+The workhorse of this module is the main_loop function, which executes:
+
+ - Use Unix.select to wait for any of the active file descriptors to have input to read:
+  #+BEGIN_SRC ocaml
+  Unix.select (List.map fst !active_files) [] [] (-1.)
+  #+END_SRC
+   - Note: The parameters to select are:
+     - 0: File descriptors to wait for reading
+     - 1: File descriptors to wait for writing
+     - 2: File descriptors to wait for exceptions
+     - 3: Timeout
+ - Once any file descriptors are available for reading, the loop loads
+   the associated IO channel, and calls the controller on it:
+  #+BEGIN_SRC ocaml
+  let (funct, iochan) = (List.assoc fd !active_files) in
+  funct iochan
+  #+END_SRC
+ - This repeats until a mutable reference =continue_main_loop=
+   is set to false by calling the function =exit_main_loop=.
+***** User input
+User input is incorporated into the main loop by adding a file
+descriptor for stdio, whose controller is =exit_main_loop= - i.e as soon
+as any user input is ready, the main loop ends.
+
+The engine can then toggle user input by either adding or removing the stdio channel:
+#+BEGIN_SRC ocaml
+(* Stop reading user input. *)
+let stop_user_input () =
+  remove_file !user_channel
+#+END_SRC
+
+Then, when resuming input, the stdio is added back in again:
+#+BEGIN_SRC ocaml
+(* Resume reading user input. *)
+let resume_user_input () =
+  if !interactif && !Parameters.prompt then begin
+    print_string !current_prompt;
+    flush Stdlib.stdout
+  end;
+  add_file !user_channel exit_main_loop
+#+END_SRC
+
+There is also a function =read_user_input=, which just calls main loop,
+assumes that it only terminates because the stdio controller was
+called, and then uses =Unix.input= to load the input afterwards.
+**** Source
+Defines functions to track the source code.
+
+An interesting variable it uses is =source_extensions=, which is used when 
+finding the source file for a module:
+#+BEGIN_SRC ocaml
+let source_extensions = [".ml"]
+#+END_SRC
+(Although, given that there's only one source extension, this seems to
+be an case of premature generalisation - YAGNI.)
+
+***** Source of module
+This function takes a lexing position and a module name and returns the path to the file that defines the module:
+- if the lexing position is from a file that exists, then return it
+- if there is no lexing position, 
+  - select the innermost module, and find the source file for the module in the load path for the module.
+- if it's a relative path, then resolve the relative path in terms of the load path for the module
+- otherwise, throw an error
+
+The file path resolution functions are just reused from the
+ocaml-compiler-libs.common library - located in the Misc package.
+***** Buffer
+****** Data type
+Buffers are encoded using the following data type:
+#+BEGIN_SRC ocaml
+type buffer = string * (int * int) list ref
+#+END_SRC
+The first component represents the source code for the buffer, and the
+second is a cache of position, line numbers.
+****** Buffer List
+The module tracks a mutable list of modules + buffers.
+#+BEGIN_SRC ocaml
+let buffer_list = ref ([] : (string * buffer) list)
+#+END_SRC
+External clients can then either flush the buffer list (clearing it),
+or get the buffer for a module:
+   - check if the module is cached in the buffer list - if so, return it,
+   - otherwise:
+     - use =source_of_module= to retrieve the filename, and open it[fn:1]
+     - read the contents of the buffer, set the line number cache to empty:
+      #+BEGIN_SRC ocaml
+      let buffer = (content, ref [])
+      #+END_SRC
+     - add it to the buffer list
+     - return the buffer
+***** Line number conversions
+One of the main uses of the buffer, other than the source code, is for
+translating line numbers into positions:
+ - scan forward through the cache until you find the first line number
+   strictly smaller than the desired line - call this value pos
+ - then, repeatedly increase the line number until the value is
+   strictly greater than the desired line number, and then return the
+   position immediately prior to that.
+ - finally, it stores the found position in the cache, and returns the
+   result.
+This function then allows for an easy way to convert points as
+described by an editor (line + column) into corresponding lexing positions:
+#+BEGIN_SRC ocaml
+let point_of_coord buffer line column =
+  fst (pos_of_line buffer line) + (pred column)
+#+END_SRC
+**** Debug Communication
+Defines functions to communicate with the debuggee.
+***** Data types
+****** Program counter
+Defined as follows:
+#+BEGIN_SRC ocaml
+type pc =
+  { frag : int;
+    pos : int; }
+#+END_SRC
+Currently, I'm not sure what frag/pos are meant to do.
+****** Execution summary
+#+BEGIN_SRC ocaml
+type execution_summary =
+    Event
+  | Breakpoint
+  | Exited
+  | Trap_barrier
+  | Uncaught_exc
+  | Debug_info of Instruct.debug_event list array
+  | Code_loaded of int
+  | Code_unloaded of int
+#+END_SRC
+Note: =Instruct.debug_event= is supplied by the OCaml compiler libs, and
+forms part of the definition of the abstract machine:
+#+BEGIN_SRC ocaml
+type debug_event =
+  { mutable ev_pos: int;                (* Position in bytecode *)
+    ev_module: string;                  (* Name of defining module *)
+    ev_loc: Location.t;                 (* Location in source file *)
+    ev_kind: debug_event_kind;          (* Before/after event *)
+    ev_info: debug_event_info;          (* Extra information *)
+    ev_typenv: Env.summary;             (* Typing environment *)
+    ev_typsubst: Subst.t;               (* Substitution over types *)
+    ev_compenv: compilation_env;        (* Compilation environment *)
+    ev_stacksize: int;                  (* Size of stack frame *)
+    ev_repr: debug_event_repr }         (* Position of the representative *)
+
+and debug_event_kind =
+    Event_before
+  | Event_after of Types.type_expr
+  | Event_pseudo
+
+and debug_event_info =
+    Event_function
+  | Event_return of int
+  | Event_other
+
+and debug_event_repr =
+    Event_none
+  | Event_parent of int ref
+  | Event_child of int ref
+#+END_SRC
+****** Report
+#+BEGIN_SRC ocaml
+type report =
+  { rep_type : execution_summary;
+    rep_event_count : int64;
+    rep_stack_pointer : int;
+    rep_program_pointer : pc }
+#+END_SRC
+***** Code
+The code maintains a IO channel through a mutable reference that it
+then uses to write output to:
+#+BEGIN_SRC ocaml
+(* The current connection with the debuggee *)
+let conn = ref Primitives.std_io
+#+END_SRC
+Then functions place breakpoints etc. by writing to this channel:
+#+BEGIN_SRC ocaml
+let set_event {frag; pos} =
+  output_char !conn.io_out 'e';
+  output_binary_int !conn.io_out frag;
+  output_binary_int !conn.io_out pos
+#+END_SRC
+Presumably the OCaml bytecode engine can consume these commands and
+run them.
+****** Go Do Small Int
+To run the debuggee for n events:
+- The engine first writes 'gn' to the debuggee, telling it to move forward n steps.
+- It changes the controller to =Input_handling.exit_main_loop=, and then:
+   - Runs the main loop
+   - Retrieve the next character and converts the value into an event summary
+   - returns a report capturing the event type, no events, stack pointer and program pointer
+****** Go Do
+Just calls out to smallint, repeatedly if the desired number of steps
+is larger than the maximum value of small int.
+****** Do Checkpoint
+To save a checkpoint:
+- Outputs 'c' to the debuggee
+- Retrieves an integer as response, representing the PID of the checkpointed process??
+****** Stop
+- Sends 's' to the debuggee
+****** Other commands
+The remaining commands all just send messages in a similar way to the
+ones listed above, occasionally returning values back from the debuggee:
+- Wait child - sends 'w', asks process to kill children
+- Initial frame - sends '0', asks process to move to initial frame
+- Up frame - sends 'U...', moves up one frame, returns stack position
+- Get Frame - sends 'f', returns the current frame position
+- Set frame - sends 'S...'
+- Set trap barrier - sends 'b...'
+**** Checkpoints
+Defines a library for persisting a sequence of checkpoints.
+***** Datatype
+A checkpoint is defined as the following data type:
+#+BEGIN_SRC ocaml
+type checkpoint =
+  {mutable c_time : int64;
+   mutable c_pid : int;
+   mutable c_fd : io_channel;
+   mutable c_valid : bool;
+   mutable c_report : report option;
+   mutable c_state : checkpoint_state;
+   mutable c_parent : checkpoint;
+   mutable c_breakpoint_version : int;
+   mutable c_breakpoints : (pc * int ref) list;
+   mutable c_trap_barrier : int;
+   mutable c_code_fragments : int list}
+#+END_SRC
+Important fields are c_pid which is the pid of the checkpoint, and
+c_parent, which is the parent of the current checkpoint.
+***** Implementation
+Starts by defining a root checkpoint using a recursive value that is its own parent:
+#+BEGIN_SRC ocaml
+let rec root = {
+  c_time = _0;
+  c_pid = -2;
+  ...
+  c_parent = root;
+  ...
+  }
+#+END_SRC
+The file also maintains and exports!! a mutable list of checkpoints and a mutable reference to the initial checkpoint:
+#+BEGIN_SRC ocaml
+let checkpoints = ref ([] : checkpoint list)
+let current_checkpoint = ref root
+#+END_SRC
+**** Program Loading
+This file seems to define functions for loading programs.  The core
+function is exec, which then builds a shell command to execute the
+program bytecode using OCamlrun, setting the program variables and
+crucially the variable CAML_DEBUG_SOCKET to tell the OCaml bytecode
+runner to communicate with the corresponding socket.
+
+It then uses the tying-the-knot forward declaration technique to
+define a launching function that calls exec direct and then runs the
+main loop.
+**** Show source
+Defines functions to communicate the source code position - if running
+in Emacs, then just returns the filename, line and column, otherwise
+prints out the source code with line numbers.
+**** Symbols
+Defines functions to track symbols in bytecodes and events?
+Core functionality revolves around three hashtables that it maintains:
+ - Events by pc
+ - Events by module
+ - All Events by module
+(Events by module only contains non-pseudo events).
+
+Aside from this, it provides a couple of helper functions
+***** Read Symbols
+This function reads events from a bytecode file:
+- First, it checks that the file has the right magic number, and then
+  checks that the file contains both a Symbol table and DEBUG section
+- Then it moves to the debug section, and reads the a list of debug
+  events, extracting the modules for each one.
+***** Add events
+This function adds a list of events from a fragment to the tables - it
+sorts events by position, and then iterates through and adds them to
+the events by pc, by module an by all events in module.
+***** Other helpers
+Finally, the module provides helper functions to find events by
+position, character, etc. by looking into the tables.
+**** Eval!!!
+(THIS IS WHAT I'VE BEEN LOOKING FOR)
+Defines a function to evaluate an expression??
+#+BEGIN_SRC ocaml
+val expression : Events.code_event option -> Env.t -> expression -> Debugcom.Remote_value.t * type_expr
+#+END_SRC
+Expression here is the type of value returned from a simple parser used to consume expressions:
+#+BEGIN_SRC ocaml
+type expression =
+    E_ident of Longident.t              (* x or Mod.x *)
+  | E_name of int                       (* $xxx *)
+  | E_item of expression * int          (* x.1 x.[2] x.(3) *)
+  | E_field of expression * string      (* x.lbl !x *)
+  | E_result
+#+END_SRC
+As you can see, this is very basic, and doesn't support more complex
+expressions (local modules, let bindings etc.).
+
+The evaluation function then reuses the compiler libs' =Env= module, and
+evaluates an expression given an env:
+***** Evaluating Identifiers
+- To evaluate an identifier, it looks up the identifier in the env using =find_value_by_name=.
+- The environment returns a path and value description of the identifier.
+- The function then uses the path to lookup the value of the identifier in the heap.
+
+Finally, to determine the type of the value, it runs
+Ctype.correct_levels on the type field of the value description
+returned by env.
+**** Time travel
+Implements time travel debugging, but turns out that it's not that
+complex - essentially, each checkpoint has a time stamp, so to go back
+in time, this boils down to searching backwards through the
+checkpoints for the nearest checkpoint before a given timestamp, and then jumping to it.
+* Footnotes
+[fn:1] For some reason it opens it as a binary file - presumably this is to avoid issues with windows line endings
